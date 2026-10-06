@@ -41,6 +41,7 @@ on:
           - oneplus_ace5
           - oneplus_pad2_v
           - oneplus_13
+          - oneplus_13_b
           - oneplus_13t
           - oneplus_ace5_pro
           - oneplus_pad_2_pro
@@ -113,6 +114,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      SUKISU_COMMIT: 70fa0e092a2c81060823f8ae526eac14fdda2930
+      SUSFS_66_COMMIT: a0f9c59e2243f8a5db955f4ad1686d5e0ad26e1a
+      SUKISU_PATCH_COMMIT: 547ae94bcaec53d030398f857950c64662043a5d
+
 
     steps:
       - name: Maximize build space
@@ -157,9 +163,23 @@ jobs:
 
       - name: Initialize repo and sync
         run: |
+          if [ "${{ github.event.inputs.FEIL }}" = "oneplus_13_b" ]; then
+            test "${{ github.event.inputs.CPU }}" = "sm8750"
+            test "${{ github.event.inputs.CPUD }}" = "sun"
+            test "${{ github.event.inputs.ANDROID_VERSION }}" = "android15"
+            test "${{ github.event.inputs.KERNEL_VERSION }}" = "6.6"
+          fi
           mkdir kernel_workspace && cd kernel_workspace
           repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${{ github.event.inputs.CPU }} -m ${{ github.event.inputs.FEIL }}.xml --depth=1
           repo sync
+          # OnePlus 13 OOS16 retains the android15-6.6 GKI/KMI base.
+          if [ "${{ github.event.inputs.FEIL }}" = "oneplus_13_b" ]; then
+            git -C kernel_platform/common checkout e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+            git -C kernel_platform/msm-kernel checkout 6028f47faddaa27700f8dd3a1d83906ea8f27170
+            git checkout d50b305f7da9e14715a25120a4ac7b1a4b8b97c3
+            grep -q '^SUBLEVEL = 118$' kernel_platform/common/Makefile
+          fi
+          repo manifest -r -o "$GITHUB_WORKSPACE/source-manifest.xml"
           if [  -e kernel_platform/common/BUILD.bazel ]; then
           sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' kernel_platform/common/BUILD.bazel
           fi
@@ -184,18 +204,23 @@ jobs:
       - name: Add KernelSU-SukiSU Ultra
         run: |
           cd kernel_workspace/kernel_platform
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-          cd ./KernelSU
-          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
-          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-          export KSU_VERSION=$KSU_VERSION
-          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+          git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
+          git -C KernelSU checkout "$SUKISU_COMMIT"
+          bash KernelSU/kernel/setup.sh "$SUKISU_COMMIT"
+          test "$(git -C KernelSU rev-parse HEAD)" = "$SUKISU_COMMIT"
+          echo "KSUVER=$(git -C KernelSU rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
 
       - name: Apply Patches SukiSU Ultra
         run: |
           cd kernel_workspace
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}
+          if [ "${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}" = "android15-6.6" ]; then
+            git -C susfs4ksu checkout "$SUSFS_66_COMMIT"
+          fi
           git clone https://github.com/ShirkNeko/SukiSU_patch.git
+          git -C SukiSU_patch checkout "$SUKISU_PATCH_COMMIT"
+          git -C susfs4ksu log -1 --format='%H %s'
+          git -C SukiSU_patch log -1 --format='%H %s'
           cd kernel_platform
           echo "正在给内核打susfs补丁"
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch ./common/
@@ -211,10 +236,17 @@ jobs:
           fi
 
           cd ./common
-          patch -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch || true
+          patch --batch --forward --dry-run -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch
+          patch --batch --forward -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch
+          test -z "$(find . -name '*.rej' -print -quit)"
+          grep -q '#include <linux/susfs_def.h>' fs/proc/base.c
+          grep -q '^#define SUSFS_IS_INODE_OPEN_REDIRECT(' include/linux/susfs_def.h
+          grep -q '^#define SUSFS_IS_INODE_SUS_MAP(' include/linux/susfs_def.h
           echo "完成"
 
+      # Legacy addon targets SUSFS 1.x; SUSFS 2.x supplies its native SUS_MAP hooks.
       - name: Apply Hide Stuff Patches
+        if: ${{ github.event.inputs.FEIL != 'oneplus_13_b' }}
         run: |
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
@@ -244,20 +276,15 @@ jobs:
 
           # SUSFS config
           echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$CONFIG_FILE"
 
           # Remove check_defconfig
           sed -i 's/check_defconfig//' ./common/build.config.gki
@@ -298,7 +325,7 @@ jobs:
                 echo "CONFIG_ZSMALLOC=y" >> "msm-kernel/arch/arm64/configs/${{ github.event.inputs.CPUD }}-GKI.config"
                 echo "CONFIG_ZRAM=y" >> "msm-kernel/arch/arm64/configs/${{ github.event.inputs.CPUD }}-GKI.config"
               fi
-              
+
               echo "CONFIG_MODULE_SIG_FORCE=n" >> "$CONFIG_FILE"
             elif [ "${{ github.event.inputs.KERNEL_VERSION }}" = "5.10" ] || [ "${{ github.event.inputs.KERNEL_VERSION }}" = "5.15" ]; then
               rm "common/android/gki_aarch64_modules"
@@ -319,16 +346,29 @@ jobs:
         run: |
           cd kernel_workspace
           ./kernel_platform/build_with_bazel.py -t ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
-          
+
       - name: Fallback build kernel
         if: ${{ github.event.inputs.CPU != 'sm8650' && github.event.inputs.CPU != 'sm7675' }}
         run: |
          cd kernel_workspace
          LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
 
+      - name: Verify kernel Image and SUSFS config
+        run: |
+          image_path=$(find -L kernel_workspace/kernel_platform/out kernel_workspace/kernel_platform/bazel-out -type f -name Image -size +0c -print -quit 2>/dev/null || true)
+          test -n "$image_path" || { echo "::error::Kernel build did not produce Image"; exit 1; }
+          config_path=$(find -L kernel_workspace/kernel_platform/out kernel_workspace/kernel_platform/bazel-out -type f -name .config -path '*common*' -print -quit 2>/dev/null || true)
+          test -n "$config_path"
+          for option in KSU KSU_SUSFS KSU_SUSFS_SUS_MAP KSU_SUSFS_OPEN_REDIRECT; do
+            grep -qx "CONFIG_$option=y" "$config_path"
+          done
+          sha256sum "$image_path"
+          cp "$config_path" kernel.config
+
       - name: Make AnyKernel3
         run: |
-          git clone https://github.com/Numbersf/AnyKernel3 --depth=1
+          git clone https://github.com/Numbersf/AnyKernel3
+          git -C AnyKernel3 checkout 47f23f7ece3ef212a392ec9ea5466e5f0b55d3c7
           rm -rf ./AnyKernel3/.git
 
           dir1="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
@@ -387,40 +427,35 @@ jobs:
       - name: Apply patch_linux and replace Image
         if: ${{ github.event.inputs.KPM == 'true' }}
         run: |
-          cd /home/runner/work/Action_OnePlus_MKSU_SUSFS/Action_OnePlus_MKSU_SUSFS/kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist
 
-          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch_linux
+          cp "$GITHUB_WORKSPACE/kernel_workspace/SukiSU_patch/kpm/patch_linux" patch_linux
           chmod +x patch_linux
           ./patch_linux
           rm -f Image
           mv oImage Image
           cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
 
-      # 下载 SUSFS 模块（CI）
-      - name: Download Latest SUSFS Module from CI
-        if: ${{ github.event.inputs.SUSFS_CI == 'true' }}
+      - name: Download SUSFS userspace module
         run: |
-          LATEST_RUN_ID=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success" | \
-            jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
-
-          if [ -z "$LATEST_RUN_ID" ]; then
-            echo "No successful run found for branch v1.5.2+"
-            exit 1
+          module_url='https://github.com/sidex15/susfs4ksu-module/releases/download/v1.5.2%2B_R28/ksu_module_susfs_1.5.2%2B.zip'
+          if [ "${{ github.event.inputs.SUSFS_CI }}" = "true" ]; then
+            # Cross-repository Actions archives cannot use this repository's GITHUB_TOKEN.
+            if curl -fL --retry 2 'https://nightly.link/sidex15/susfs4ksu-module/workflows/build/v1.5.2%2B/ksu_module_susfs.zip' -o susfs-ci.zip && unzip -t susfs-ci.zip; then
+              mkdir susfs-ci
+              unzip -q susfs-ci.zip -d susfs-ci
+              module_path=$(find susfs-ci -type f -name 'ksu_module_susfs*.zip' -print -quit)
+              if [ -n "$module_path" ]; then
+                cp "$module_path" ksu_module_susfs.zip
+              fi
+            fi
           fi
-
-          ARTIFACT_URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$LATEST_RUN_ID/artifacts" | jq -r '.artifacts[0].archive_download_url')
-
-          curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -o ksu_module_susfs.zip "$ARTIFACT_URL"
+          if [ ! -s ksu_module_susfs.zip ]; then
+            echo 'CI module unavailable; using pinned SUSFS module release R28'
+            curl -fL --retry 2 "$module_url" -o ksu_module_susfs.zip
+          fi
+          unzip -t ksu_module_susfs.zip
           cp ksu_module_susfs.zip ./AnyKernel3/
-
-      # 下载 SUSFS 模块（Release）
-      - name: Download Latest SUSFS Module from Release
-        if: ${{ github.event.inputs.SUSFS_CI == 'false' }}
-        run: |
-          wget https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip
-          cp ksu_module_susfs_1.5.2+.zip ./AnyKernel3/
 
       - name: Set suffix
         id: suffix
@@ -435,8 +470,21 @@ jobs:
           clean_feil="${clean_feil%_u}"  # 去掉结尾的 _u（如果有）
           echo "value=$clean_feil" >> $GITHUB_OUTPUT
 
+      - name: Package and verify AnyKernel3 ZIP
+        run: |
+          test -s AnyKernel3/Image
+          mkdir -p artifacts
+          cp AnyKernel3/Image artifacts/Image
+          cp source-manifest.xml kernel.config artifacts/
+          zip_name="AnyKernel3_SukiSUUltra_${{ env.KSUVER }}_${{ steps.feil_clean.outputs.value }}${{ steps.suffix.outputs.value }}.zip"
+          (cd AnyKernel3 && zip -qr "$GITHUB_WORKSPACE/artifacts/$zip_name" .)
+          unzip -t "artifacts/$zip_name"
+          unzip -p "artifacts/$zip_name" Image | cmp - artifacts/Image
+          (cd artifacts && sha256sum Image "$zip_name" > SHA256SUMS)
+
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v4
         with:
           name: AnyKernel3_SukiSUUltra_${{ env.KSUVER }}_${{ steps.feil_clean.outputs.value }}${{ steps.suffix.outputs.value }}
-          path: ./AnyKernel3/*
+          path: ./artifacts/*
+          if-no-files-found: error
