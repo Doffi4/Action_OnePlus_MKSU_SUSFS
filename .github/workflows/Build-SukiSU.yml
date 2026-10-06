@@ -440,18 +440,12 @@ jobs:
         run: |
           module_url='https://github.com/sidex15/susfs4ksu-module/releases/download/v1.5.2%2B_R28/ksu_module_susfs_1.5.2%2B.zip'
           if [ "${{ github.event.inputs.SUSFS_CI }}" = "true" ]; then
-            # Cross-repository Actions archives cannot use this repository's GITHUB_TOKEN.
-            if curl -fL --retry 2 'https://nightly.link/sidex15/susfs4ksu-module/workflows/build/v1.5.2%2B/ksu_module_susfs.zip' -o susfs-ci.zip && unzip -t susfs-ci.zip; then
-              mkdir susfs-ci
-              unzip -q susfs-ci.zip -d susfs-ci
-              module_path=$(find susfs-ci -type f -name 'ksu_module_susfs*.zip' -print -quit)
-              if [ -n "$module_path" ]; then
-                cp "$module_path" ksu_module_susfs.zip
-              fi
-            fi
-          fi
-          if [ ! -s ksu_module_susfs.zip ]; then
-            echo 'CI module unavailable; using pinned SUSFS module release R28'
+            # Reproduce upstream build.yml packaging from a pinned source tree.
+            git clone --branch v1.5.2+ https://github.com/sidex15/susfs4ksu-module susfs-module
+            git -C susfs-module checkout d89818e83d5a9d9be8c741325c56cc5824a658f9
+            sed -i 's/version=v1.5.2-R.*/version=v1.5.2-CI-d89818e/' susfs-module/module.prop
+            (cd susfs-module && zip -qr ../ksu_module_susfs.zip . -x '.git/*' '.github/*' 'node_modules/*' 'src/*' 'tests/*' README.md LICENSE)
+          else
             curl -fL --retry 2 "$module_url" -o ksu_module_susfs.zip
           fi
           unzip -t ksu_module_susfs.zip
